@@ -1,0 +1,8 @@
+{
+  "name": "stonks",
+  "version": "1.0.0",
+  "description": "Stonks Market Simulator",
+  "dependencies": {
+    "node-appwrite": "^14.0.0"
+  }
+}
