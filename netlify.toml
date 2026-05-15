@@ -1,0 +1,8 @@
+[build]
+  publish = "."
+
+[functions]
+  node_bundler = "esbuild"
+
+[functions.tick]
+  schedule = "* * * * *"
