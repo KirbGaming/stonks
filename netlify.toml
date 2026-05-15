@@ -1,6 +1,9 @@
 [build]
   publish = "."
 
+[build.environment]
+  SECRETS_SCAN_OMIT_KEYS = "APPWRITE_ENDPOINT,APPWRITE_PROJECT_ID,APPWRITE_DATABASE_ID,PRICES_COLLECTION_ID,EVENT_COLLECTION_ID,PLAYERS_COLLECTION_ID"
+
 [functions]
   node_bundler = "esbuild"
 
