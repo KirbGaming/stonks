@@ -247,6 +247,7 @@ html,body{background:#0d0d0d;color:#e0e0e0;font-family:'JetBrains Mono','Fira Co
 .nc-sev-badge{font-size:9px;letter-spacing:.06em;padding:2px 6px;border-radius:10px;border:.5px solid currentColor;opacity:.8}
 .nc-affect{font-size:10px;margin-left:auto}
 .nc-time{font-size:9px;color:#555;margin-left:6px}
+.nc-ago{font-size:9px;color:#3a3a3a;margin-left:4px;font-style:italic}
 .nc-title{font-size:clamp(11px,1.1vw,14px);font-weight:600;line-height:1.35;margin-bottom:4px;color:#e8e8e8;letter-spacing:.01em}
 .nc-desc{font-size:clamp(9px,.85vw,11px);color:#888;line-height:1.5;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .sev-light{color:#7aaa7a}.sev-moderate{color:#aaaa5a}.sev-heavy{color:#c8844a}.sev-extreme{color:#cc5a5a}.sev-absurd{color:#cc44cc}
@@ -509,6 +510,7 @@ html,body{background:#0d0d0d;color:#e0e0e0;font-family:'JetBrains Mono','Fira Co
 #xp-toast{position:fixed;top:clamp(56px,7vw,80px);right:clamp(10px,2vw,24px);font-size:clamp(10px,.9vw,12px);font-weight:600;letter-spacing:.06em;color:#c8a840;pointer-events:none;z-index:999;opacity:0;transform:translateY(0);transition:opacity .25s ease,transform .25s ease}
 #xp-toast.show{opacity:1;transform:translateY(-6px)}
 </style>
+<script src="https://cdn.jsdelivr.net/npm/appwrite@16.0.2/dist/iife/sdk.js"></script>
 </head>
 <body>
 <!-- LOGIN SCREEN -->
@@ -654,7 +656,7 @@ html,body{background:#0d0d0d;color:#e0e0e0;font-family:'JetBrains Mono','Fira Co
 
         <div class="ctr-field">
           <label>WAGER ($)</label>
-          <input class="ctr-input" type="number" id="ctr-wager" value="100" min="1" step="1" oninput="updatePayoutPreview()">
+          <input class="ctr-input" type="number" id="ctr-wager" value="1000" min="1000" step="1" oninput="updatePayoutPreview()">
         </div>
 
         <!-- Payout preview -->
@@ -815,6 +817,156 @@ html,body{background:#0d0d0d;color:#e0e0e0;font-family:'JetBrains Mono','Fira Co
 
 <script>
 /* ═══════════════════════════════════════════════════════════
+   APPWRITE CONFIG
+═══════════════════════════════════════════════════════════ */
+const AW_ENDPOINT='https://sfo.cloud.appwrite.io/v1';
+const AW_PROJECT ='6a0533c100121fcb8fe9';
+const AW_DB      ='6a053482001be502bdba';
+const AW_PRICES  ='prices';
+const AW_EVENT   ='daily_event';
+const AW_PLAYERS ='players';
+let awClient,awDB;
+let lastRealtimeUpdate=0;
+let _saveTimeout=null;
+let _playerMeta={passwordHash:'',created:''};
+
+function initAppwrite(){
+  awClient=new Appwrite.Client().setEndpoint(AW_ENDPOINT).setProject(AW_PROJECT);
+  awDB=new Appwrite.Databases(awClient);
+}
+async function hashPw(pw){
+  const buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(pw));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+function applyPlayerData(saved){
+  cash=saved.cash??10000;
+  holdings=saved.holdings??{};
+  tradeLog=saved.tradeLog??[];
+  contractHistory=saved.contractHistory??[];
+  contracts=(saved.contracts??[]).map(c=>({...c,expiryTime:typeof c.expiryTime==='number'?c.expiryTime:Date.now()+(24*60*60*1000)}));
+  xp=saved.xp??0;
+  watchlist=new Set(saved.watchlist??[]);
+  realizedPnL=saved.realizedPnL??0;
+  tradeId=tradeLog.length>0?Math.max(...tradeLog.map(t=>t.id)):0;
+  contractId=[...contractHistory,...contracts].length>0?Math.max(...[...contractHistory,...contracts].map(c=>c.id)):0;
+  prevPort=pv();
+  dayPV=saved.dayPV??pv();
+}
+function savePlayerData(){
+  if(!currentUser)return;
+  clearTimeout(_saveTimeout);
+  _saveTimeout=setTimeout(_doSave,1500);
+}
+async function _doSave(){
+  if(!currentUser)return;
+  const data=JSON.stringify({
+    ..._playerMeta,cash,holdings,
+    tradeLog:tradeLog.slice(-25),
+    contractHistory:contractHistory.slice(0,25),
+    contracts:contracts.filter(c=>c.status==='active'&&!c._closing),
+    xp,watchlist:[...watchlist],realizedPnL,dayPV,
+  });
+  try{
+    await awDB.updateDocument(AW_DB,AW_PLAYERS,currentUser,{userId:currentUser,username:currentUser,data});
+  }catch(e){
+    try{
+      await awDB.createDocument(AW_DB,AW_PLAYERS,currentUser,{userId:currentUser,username:currentUser,data});
+    }catch(e2){console.error('Save failed:',e2);}
+  }
+}
+async function loadPrices(){
+  try{
+    const doc=await awDB.getDocument(AW_DB,AW_PRICES,'current');
+    applyServerPrices(JSON.parse(doc.data));
+  }catch(e){console.log('No server prices yet, using local init');}
+}
+function applyServerPrices(data){
+  if(!data||!data.stocks)return;
+  STOCKS.forEach(s=>{
+    const info=data.stocks[s.t];if(!info)return;
+    prevPrices[s.t]=prices[s.t];
+    prices[s.t]=info.price;
+    momentum[s.t]=info.momentum||0;
+    fairValue[s.t]=info.fairValue||prices[s.t];
+    streakDir[s.t]=info.streakDir||'up';
+    streakBase[s.t]=info.streakBase||prices[s.t];
+    if(prevPrices[s.t]&&prevPrices[s.t]!==prices[s.t]){
+      const sw=Math.abs(prices[s.t]-prevPrices[s.t]);
+      ohlc[s.t].push({
+        o:prevPrices[s.t],
+        h:Math.max(prevPrices[s.t],prices[s.t])+Math.random()*sw*.5+.01,
+        l:Math.max(.01,Math.min(prevPrices[s.t],prices[s.t])-Math.random()*sw*.5-.01),
+        c:prices[s.t],v:Math.floor(Math.random()*900+80),
+      });
+      if(ohlc[s.t].length>NC)ohlc[s.t].shift();
+    }
+    const dir=prices[s.t]>=prevPrices[s.t]?'up':'down';
+    if(dir!==streakDir[s.t]){streakBase[s.t]=prevPrices[s.t];streakDir[s.t]=dir;}
+  });
+  lastRealtimeUpdate=Date.now();
+  checkTPSLLocal();
+  checkContracts();
+  const nowDayStr=new Date().toDateString();
+  if(nowDayStr!==lastDayStr){lastDayStr=nowDayStr;STOCKS.forEach(s=>{openP[s.t]=prices[s.t];});dayPV=pv();}
+  document.getElementById('day-lbl').textContent=fmtDateTime(new Date());
+  render();
+}
+async function loadDailyEvent(){
+  try{
+    const doc=await awDB.getDocument(AW_DB,AW_EVENT,'today');
+    const today=new Date().toDateString();
+    if(doc.date===today&&!firedEvents.has(doc.eventName)){
+      const ev=NEWS_EVENTS.find(e=>e.EventName===doc.eventName);
+      if(ev){
+        firedEvents.add(ev.EventName);
+        applyEvent(ev);
+        const evTime=new Date(doc.$updatedAt||doc.$createdAt||Date.now());
+        newsItems.unshift({ev,time:evTime});
+        if(activeTab!=='news'){unreadNews++;updateNewsBadge();}
+        if(activeTab==='news')renderNews();
+      }
+    }
+  }catch(e){/* No event today yet */}
+}
+function subscribeToRealtime(){
+  awClient.subscribe(
+    `databases.${AW_DB}.collections.${AW_PRICES}.documents.current`,
+    res=>{if(res.payload&&res.payload.data)applyServerPrices(JSON.parse(res.payload.data));}
+  );
+  awClient.subscribe(
+    `databases.${AW_DB}.collections.${AW_EVENT}.documents.today`,
+    ()=>loadDailyEvent()
+  );
+}
+function checkTPSLLocal(){
+  Object.entries(holdings).forEach(([t,h])=>{
+    if(!h||!h.s)return;
+    const p=prices[t];
+    if(h.tp&&p>=h.tp){
+      const proceeds=p*h.s;const tpProfit=proceeds-h.c*h.s;realizedPnL+=tpProfit;
+      cash+=proceeds;
+      tradeLog.push({id:++tradeId,type:'SELL',ticker:t,qty:h.s,price:p,total:proceeds,date:fmtDate(new Date())});
+      delete holdings[t];
+      grantXP(25+Math.min(Math.floor(tpProfit/18),160));
+      showMsg('✓ Take Profit hit — sold '+t+' @ '+fmt(p),'#6aaa6a');
+      savePlayerData();
+    }else if(h.sl&&p<=h.sl){
+      const proceeds=p*h.s;realizedPnL+=proceeds-h.c*h.s;
+      cash+=proceeds;
+      tradeLog.push({id:++tradeId,type:'SELL',ticker:t,qty:h.s,price:p,total:proceeds,date:fmtDate(new Date())});
+      delete holdings[t];
+      grantXP(10);
+      showMsg('⚠ Stop Loss hit — sold '+t+' @ '+fmt(p),'#aa5a5a');
+      savePlayerData();
+    }
+  });
+}
+function localFallbackTick(){
+  if(Date.now()-lastRealtimeUpdate<90000)return;
+  doTick();
+}
+
+/* ═══════════════════════════════════════════════════════════
    STOCKS
 ═══════════════════════════════════════════════════════════ */
 const STOCKS=[
@@ -884,6 +1036,15 @@ function fmtDateTime(d){
   const ampm=h>=12?'PM':'AM';
   h=h%12||12;
   return`${mon} ${day}, ${yr}, ${h}:${m} ${ampm}`;
+}
+function timeAgo(d){
+  const diff=Date.now()-d.getTime();
+  const mins=Math.floor(diff/60000);
+  if(mins<1)return'just now';
+  if(mins<60)return mins+'m ago';
+  const hrs=Math.floor(mins/60);
+  if(hrs<24)return hrs+'h ago';
+  return Math.floor(hrs/24)+'d ago';
 }
 /* Track real calendar day for Day P&L resets */
 let lastDayStr=new Date().toDateString();
@@ -1021,7 +1182,7 @@ function renderNews(){
     const imgHtml=ev.EventImg
       ?`<img class="nc-img" src="${ev.EventImg}" alt="" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="nc-img-fallback">${em}</div>`
       :`<div class="nc-img-fallback" style="display:flex">${em}</div>`;
-    return`<div class="news-card">${imgHtml}<div class="nc-bar"><div class="nc-meta"><span class="nc-type-badge" style="background:${tc}22;color:${tc};border:.5px solid ${tc}44">${ev.EventType}</span><span class="nc-sev-badge ${sc}">${ev.EventSeverity}</span><span class="nc-affect ${affCls}">${affIcon} ${ev.EventAffect}</span><span class="nc-time">${fmtDate(time)}</span></div><div class="nc-title">${ev.EventTitle}</div><div class="nc-desc">${ev.EventDesc}</div></div></div>`;
+    return`<div class="news-card">${imgHtml}<div class="nc-bar"><div class="nc-meta"><span class="nc-type-badge" style="background:${tc}22;color:${tc};border:.5px solid ${tc}44">${ev.EventType}</span><span class="nc-sev-badge ${sc}">${ev.EventSeverity}</span><span class="nc-affect ${affCls}">${affIcon} ${ev.EventAffect}</span><span class="nc-time">${fmtDateTime(time)}</span><span class="nc-ago">${timeAgo(time)}</span></div><div class="nc-title">${ev.EventTitle}</div><div class="nc-desc">${ev.EventDesc}</div></div></div>`;
   }).join('');
 }
 
@@ -1102,7 +1263,7 @@ function openContract(){
 
   if(!ticker){showCtrMsg('Select a stock.','#aa5a5a');return;}
   if(!tPct||tPct<1||tPct>50){showCtrMsg('Target must be 1–50%.','#aa5a5a');return;}
-  if(!wager||wager<1){showCtrMsg('Enter a valid wager.','#aa5a5a');return;}
+  if(!wager||wager<1000){showCtrMsg('Minimum wager is $1,000.','#aa5a5a');return;}
   if(wager>cash){showCtrMsg('Insufficient cash.','#aa5a5a');return;}
 
   const mult=calcMultiplier(tPct);
@@ -1111,6 +1272,7 @@ function openContract(){
 
   cash-=wager;
   grantXP(30);
+  savePlayerData();
   contracts.push({
     id:++contractId,
     ticker,
@@ -1144,11 +1306,13 @@ function checkContracts(){
         c._closing=true;showContractResult(c,'won');
         grantXP(100+Math.min(Math.floor((payout-c.wager)/12),260));
         showMsg('✓ Contract hit! +'+fmt(payout-c.wager)+' on '+c.ticker,'#6aaa6a');
+        savePlayerData();
       } else if(pctChange<=-c.stopPct){
         c.status='lost';c.closePct=pctChange;c.payout=0;c.closeDate=fmtDate(new Date());
         c._closing=true;showContractResult(c,'lost');
         grantXP(10);
         showMsg('✗ Contract stopped out: '+c.ticker+' went '+pctChange.toFixed(1)+'%','#aa5a5a');
+        savePlayerData();
       }
     } else {
       if(pctChange<=-c.targetPct){
@@ -1158,11 +1322,13 @@ function checkContracts(){
         c._closing=true;showContractResult(c,'won');
         grantXP(100+Math.min(Math.floor((payout-c.wager)/12),260));
         showMsg('✓ Contract hit! +'+fmt(payout-c.wager)+' on '+c.ticker,'#6aaa6a');
+        savePlayerData();
       } else if(pctChange>=c.stopPct){
         c.status='lost';c.closePct=pctChange;c.payout=0;c.closeDate=fmtDate(new Date());
         c._closing=true;showContractResult(c,'lost');
         grantXP(10);
         showMsg('✗ Contract stopped out: '+c.ticker+' went +'+pctChange.toFixed(1)+'%','#aa5a5a');
+        savePlayerData();
       }
     }
 
@@ -1171,6 +1337,7 @@ function checkContracts(){
       c._closing=true;showContractResult(c,'expired');
       grantXP(5);
       showMsg('⏱ Contract expired: '+c.ticker+' · wager lost','#666');
+      savePlayerData();
     }
   });
   // Keep closing contracts in array until animation removes them
@@ -1726,44 +1893,41 @@ function syncSlistHeight(){
   if(cpanel&&slist){slist.style.height=cpanel.offsetHeight+'px';}
 }
 
-function renderLB(){
-  const total=pv();
-  const tPnl=total-10000;
-
-  // Aggregate share stats across all holdings
-  const ents=Object.entries(holdings).filter(([,h])=>h.s>0);
-  const totalShares=ents.reduce((s,[,h])=>s+h.s,0);
-  const totalCost=ents.reduce((s,[,h])=>s+h.s*h.c,0);
-  const avgCost=totalShares>0?totalCost/totalShares:0;
-
-  // Single player row — ready to accept more rows when multiplayer lands
-  const rows=[{
-    rank:1,
-    name:playerName||'Player',
-    totalShares,
-    avgCost,
-    portfolioValue:total,
-    cash,
-    tPnl,
-    isYou:true,
-  }];
-
-  document.getElementById('lb-body').innerHTML=rows.map(r=>{
-    const pnlStr=(r.tPnl>=0?'+':'-')+fmt(Math.abs(r.tPnl));
-    const pnlCol=r.tPnl>=0?'#6aaa6a':'#aa5a5a';
-    const rankCls=r.rank===1?'rank-1':r.rank===2?'rank-2':r.rank===3?'rank-3':'';
-    return`<tr style="${r.isYou?'background:#111':''}">
-      <td>
-        <span class="lb-rank ${rankCls}">#${r.rank}</span>
-        ${r.name}${r.isYou?' <span style="font-size:9px;color:#555">(you)</span>':''}
-      </td>
-      <td>${r.totalShares>0?r.totalShares:'—'}</td>
-      <td>${r.avgCost>0?fmt(r.avgCost):'—'}</td>
-      <td>${fmt(r.portfolioValue)}</td>
-      <td>${fmt(r.cash)}</td>
-      <td style="color:${pnlCol};font-weight:500">${pnlStr}</td>
-    </tr>`;
-  }).join('');
+async function renderLB(){
+  const lbBody=document.getElementById('lb-body');
+  lbBody.innerHTML='<tr><td colspan="6" style="color:#444;padding:20px;text-align:center">Loading…</td></tr>';
+  try{
+    const result=await awDB.listDocuments(AW_DB,AW_PLAYERS);
+    const rows=result.documents.map(doc=>{
+      let saved={};try{saved=JSON.parse(doc.data);}catch(e){}
+      const h=saved.holdings||{};
+      const c=saved.cash||0;
+      let portVal=c;
+      Object.entries(h).forEach(([t,hld])=>{if(prices[t])portVal+=hld.s*prices[t];});
+      const tPnl=portVal-10000;
+      const totalShares=Object.values(h).reduce((s,hld)=>s+hld.s,0);
+      const totalCost=Object.values(h).reduce((s,hld)=>s+hld.s*hld.c,0);
+      const avgCost=totalShares>0?totalCost/totalShares:0;
+      return{name:doc.username,cash:c,portfolioValue:portVal,tPnl,totalShares,avgCost,isYou:doc.userId===currentUser};
+    });
+    rows.sort((a,b)=>b.portfolioValue-a.portfolioValue);
+    lbBody.innerHTML=rows.map((r,i)=>{
+      const rank=i+1;
+      const pnlStr=(r.tPnl>=0?'+':'-')+fmt(Math.abs(r.tPnl));
+      const pnlCol=r.tPnl>=0?'#6aaa6a':'#aa5a5a';
+      const rankCls=rank===1?'rank-1':rank===2?'rank-2':rank===3?'rank-3':'';
+      return`<tr style="${r.isYou?'background:#111':''}">
+        <td><span class="lb-rank ${rankCls}">#${rank}</span>${r.name}${r.isYou?' <span style="font-size:9px;color:#555">(you)</span>':''}</td>
+        <td>${r.totalShares>0?r.totalShares:'—'}</td>
+        <td>${r.avgCost>0?fmt(r.avgCost):'—'}</td>
+        <td>${fmt(r.portfolioValue)}</td>
+        <td>${fmt(r.cash)}</td>
+        <td style="color:${pnlCol};font-weight:500">${pnlStr}</td>
+      </tr>`;
+    }).join('');
+  }catch(e){
+    lbBody.innerHTML='<tr><td colspan="6" style="color:#444;padding:20px;text-align:center">Could not load leaderboard.</td></tr>';
+  }
 }
 
 function flashEl(id,up){
@@ -1854,6 +2018,7 @@ function trade(type){
     grantXP(sellXP);
     showMsg('Sold '+qty+' '+sel+' @ '+fmt(p),'#aa5a5a');
   }
+  savePlayerData();
   render();
 }
 
@@ -1882,27 +2047,8 @@ function doTick(){
       streakDir[s.t]=dir;
     }
   });
-  // Check TP/SL on holdings
-  Object.entries(holdings).forEach(([t,h])=>{
-    if(!h||!h.s)return;
-    const p=prices[t];
-    if(h.tp&&p>=h.tp){
-      const proceeds=p*h.s;const tpProfit=proceeds-h.c*h.s;realizedPnL+=tpProfit;
-      cash+=proceeds;
-      tradeLog.push({id:++tradeId,type:'SELL',ticker:t,qty:h.s,price:p,total:proceeds,date:fmtDate(new Date())});
-      delete holdings[t];
-      grantXP(25+Math.min(Math.floor(tpProfit/18),160));
-      showMsg('✓ Take Profit hit — sold '+t+' @ '+fmt(p),'#6aaa6a');
-    } else if(h.sl&&p<=h.sl){
-      const proceeds=p*h.s;realizedPnL+=proceeds-h.c*h.s;
-      cash+=proceeds;
-      tradeLog.push({id:++tradeId,type:'SELL',ticker:t,qty:h.s,price:p,total:proceeds,date:fmtDate(new Date())});
-      delete holdings[t];
-      grantXP(10);
-      showMsg('⚠ Stop Loss hit — sold '+t+' @ '+fmt(p),'#aa5a5a');
-    }
-  });
-  // Check contracts
+  // Check TP/SL and contracts
+  checkTPSLLocal();
   checkContracts();
   // Reset Day P&L at real midnight
   const nowDayStr=new Date().toDateString();
@@ -1913,7 +2059,6 @@ function doTick(){
   }
   // Always update the live clock
   document.getElementById('day-lbl').textContent=fmtDateTime(new Date());
-  checkNews();
   render();
 }
 
@@ -1932,46 +2077,58 @@ window.addEventListener('resize',()=>{
 });
 
 /* ═══════════════════════════════════════════════════════════
-   AUTH — localStorage-backed, temporary until API
+   AUTH — Appwrite-backed
 ═══════════════════════════════════════════════════════════ */
-const ACCTS_KEY='stonks_accounts';
 const SESS_KEY='stonks_session';
 let currentUser=null;
-let authMode='signin'; // 'signin' | 'create'
+let authMode='signin';
 
-function getAccounts(){return JSON.parse(localStorage.getItem(ACCTS_KEY)||'{}');}
-function saveAccounts(a){localStorage.setItem(ACCTS_KEY,JSON.stringify(a));}
-
-function authSubmit(){
-  const user=document.getElementById('lc-user').value.trim();
+async function authSubmit(){
+  const user=document.getElementById('lc-user').value.trim().toLowerCase();
   const pass=document.getElementById('lc-pass').value;
   const err=document.getElementById('lc-err');
+  const btn=document.getElementById('lc-submit');
   err.textContent='';
   if(!user){err.textContent='Username required.';return;}
   if(!pass){err.textContent='Password required.';return;}
-  if(authMode==='create'){
-    const pass2=document.getElementById('lc-pass2').value;
-    if(user.length<2){err.textContent='Username must be at least 2 characters.';return;}
-    if(pass.length<4){err.textContent='Password must be at least 4 characters.';return;}
-    if(pass!==pass2){err.textContent='Passwords do not match.';return;}
-    const accts=getAccounts();
-    if(accts[user]){err.textContent='Username already taken.';return;}
-    accts[user]={password:pass,created:new Date().toISOString()};
-    saveAccounts(accts);
-    startSession(user);
-  } else {
-    const accts=getAccounts();
-    if(!accts[user]){err.textContent='Account not found.';return;}
-    if(accts[user].password!==pass){err.textContent='Incorrect password.';return;}
-    startSession(user);
+  btn.textContent='…';btn.disabled=true;
+  try{
+    const hash=await hashPw(pass);
+    if(authMode==='create'){
+      const pass2=document.getElementById('lc-pass2').value;
+      if(user.length<2){err.textContent='Username must be at least 2 characters.';return;}
+      if(pass.length<4){err.textContent='Password must be at least 4 characters.';return;}
+      if(pass!==pass2){err.textContent='Passwords do not match.';return;}
+      try{await awDB.getDocument(AW_DB,AW_PLAYERS,user);err.textContent='Username already taken.';return;}catch(e){}
+      const created=new Date().toISOString();
+      const data=JSON.stringify({passwordHash:hash,created,cash:10000,holdings:{},tradeLog:[],contractHistory:[],contracts:[],xp:0,watchlist:[],realizedPnL:0,dayPV:10000});
+      await awDB.createDocument(AW_DB,AW_PLAYERS,user,{userId:user,username:user,data});
+      _playerMeta={passwordHash:hash,created};
+      startSession(user);
+    }else{
+      let doc;
+      try{doc=await awDB.getDocument(AW_DB,AW_PLAYERS,user);}catch(e){err.textContent='Account not found.';return;}
+      const saved=JSON.parse(doc.data);
+      if(saved.passwordHash!==hash){err.textContent='Incorrect password.';return;}
+      _playerMeta={passwordHash:saved.passwordHash||'',created:saved.created||''};
+      applyPlayerData(saved);
+      startSession(user);
+    }
+  }catch(e){
+    err.textContent='Connection error. Try again.';
+    console.error(e);
+  }finally{
+    btn.textContent=authMode==='create'?'Create Account':'Sign In';
+    btn.disabled=false;
   }
 }
 
 function startSession(user){
-  currentUser=user;
+  currentUser=user;playerName=user;
   localStorage.setItem(SESS_KEY,user);
-  playerName=user;
-  // Animate login screen out
+  subscribeToRealtime();
+  loadPrices();
+  loadDailyEvent();
   const ls=document.getElementById('login-screen');
   ls.classList.add('fade-out');
   setTimeout(()=>{ls.style.display='none';},420);
@@ -1980,15 +2137,20 @@ function startSession(user){
 function logout(){
   localStorage.removeItem(SESS_KEY);
   currentUser=null;
-  // Show login screen
+  _playerMeta={passwordHash:'',created:''};
+  cash=10000;holdings={};tradeLog=[];contracts=[];contractHistory=[];
+  realizedPnL=0;tradeId=0;contractId=0;xp=0;prevPort=10000;dayPV=10000;
+  newsItems=[];firedEvents=new Set();unreadNews=0;watchlist=new Set();
+  Object.keys(spinCache).forEach(k=>delete spinCache[k]);
   const ls=document.getElementById('login-screen');
-  ls.style.display='flex';
-  ls.classList.remove('fade-out');
+  ls.style.display='flex';ls.classList.remove('fade-out');
   document.getElementById('lc-user').value='';
   document.getElementById('lc-pass').value='';
   document.getElementById('lc-err').textContent='';
   if(authMode==='create')toggleAuthMode();
   switchTab('trade');
+  updateNewsBadge();
+  render();
 }
 
 function toggleAuthMode(){
@@ -2003,20 +2165,10 @@ function toggleAuthMode(){
   document.getElementById('lc-err').textContent='';
 }
 
-// Enter key support on login fields
-['lc-user','lc-pass','lc-pass2'].forEach(id=>{
-  document.addEventListener('DOMContentLoaded',()=>{
-    const el=document.getElementById(id);
-    if(el)el.addEventListener('keydown',e=>{if(e.key==='Enter')authSubmit();});
-  });
-});
-
 /* ═══ ACCOUNT TAB RENDER ════════════════════════════════ */
 function renderAccount(){
   if(!currentUser)return;
-  const accts=getAccounts();
-  const acct=accts[currentUser]||{};
-  const joined=acct.created?new Date(acct.created).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'—';
+  const joined=_playerMeta.created?new Date(_playerMeta.created).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'—';
   const initial=currentUser[0].toUpperCase();
   document.getElementById('acc-avatar').textContent=initial;
   document.getElementById('acc-username').textContent=currentUser;
@@ -2029,8 +2181,7 @@ function renderAccount(){
   const pct=Math.min(100,(into/needed*100)).toFixed(1);
   document.getElementById('acc-lvl-badge').textContent='LVL '+lvl;
   document.getElementById('acc-xp-fill').style.width=pct+'%';
-  document.getElementById('acc-xp-label').textContent=
-    into.toLocaleString()+' / '+needed.toLocaleString()+' XP';
+  document.getElementById('acc-xp-label').textContent=into.toLocaleString()+' / '+needed.toLocaleString()+' XP';
 
   // Live stats
   const total=pv(),tPnl=total-10000;
@@ -2049,44 +2200,43 @@ function toggleAccConfirm(type){
       const isOpen=panel.classList.contains('open');
       panel.classList.toggle('open',!isOpen);
       if(!isOpen){document.getElementById('acc-pw-'+t).value='';document.getElementById('acc-err-'+t).textContent='';}
-    } else {
-      panel.classList.remove('open');
-    }
+    }else{panel.classList.remove('open');}
   });
 }
 
-function confirmReset(){
+async function confirmReset(){
   const pw=document.getElementById('acc-pw-reset').value;
   const errEl=document.getElementById('acc-err-reset');
-  const accts=getAccounts();
-  if(!accts[currentUser]||accts[currentUser].password!==pw){errEl.textContent='Incorrect password.';return;}
-  // Reset game state
-  cash=10000;holdings={};tradeLog=[];contracts=[];contractHistory=[];
-  realizedPnL=0;tradeId=0;contractId=0;prevPort=10000;dayPV=10000;xp=0;
-  Object.keys(spinCache).forEach(k=>delete spinCache[k]);
-  toggleAccConfirm('reset');
-  renderAccount();
-  render();
-  showMsg('Account reset — back to $10,000.','#6aaa6a');
+  try{
+    const doc=await awDB.getDocument(AW_DB,AW_PLAYERS,currentUser);
+    const saved=JSON.parse(doc.data);
+    const hash=await hashPw(pw);
+    if(saved.passwordHash!==hash){errEl.textContent='Incorrect password.';return;}
+    cash=10000;holdings={};tradeLog=[];contracts=[];contractHistory=[];
+    realizedPnL=0;tradeId=0;contractId=0;prevPort=10000;dayPV=10000;xp=0;
+    Object.keys(spinCache).forEach(k=>delete spinCache[k]);
+    await _doSave();
+    toggleAccConfirm('reset');
+    renderAccount();render();
+    showMsg('Account reset — back to $10,000.','#6aaa6a');
+  }catch(e){errEl.textContent='Failed to verify. Try again.';}
 }
 
-function confirmDelete(){
+async function confirmDelete(){
   const pw=document.getElementById('acc-pw-delete').value;
   const errEl=document.getElementById('acc-err-delete');
-  const accts=getAccounts();
-  if(!accts[currentUser]||accts[currentUser].password!==pw){errEl.textContent='Incorrect password.';return;}
-  delete accts[currentUser];
-  saveAccounts(accts);
-  logout();
+  try{
+    const doc=await awDB.getDocument(AW_DB,AW_PLAYERS,currentUser);
+    const saved=JSON.parse(doc.data);
+    const hash=await hashPw(pw);
+    if(saved.passwordHash!==hash){errEl.textContent='Incorrect password.';return;}
+    await awDB.deleteDocument(AW_DB,AW_PLAYERS,currentUser);
+    logout();
+  }catch(e){errEl.textContent='Failed to delete. Try again.';}
 }
 
-window.addEventListener('DOMContentLoaded',()=>{
-  // Check for existing session and auto-login
-  const savedUser=localStorage.getItem(SESS_KEY);
-  const accts=getAccounts();
-  if(savedUser&&accts[savedUser]){
-    startSession(savedUser);
-  }
+window.addEventListener('DOMContentLoaded',async()=>{
+  initAppwrite();
 
   document.getElementById('day-lbl').textContent=fmtDateTime(new Date());
 
@@ -2106,13 +2256,36 @@ window.addEventListener('DOMContentLoaded',()=>{
 
   updatePayoutPreview();
   render();
-  // Position ink under the initially active tab once layout is ready
   requestAnimationFrame(()=>{
     const activeTabEl=document.querySelector('.tab.active');
     if(activeTabEl){moveInk(activeTabEl);document.getElementById('tab-ink').classList.add('ink-ready');}
   });
-  setInterval(doTick,3000);
-  // 1-second interval just for contract countdown display
+
+  // Check for saved session and auto-login via Appwrite
+  const savedUser=localStorage.getItem(SESS_KEY);
+  if(savedUser){
+    try{
+      const doc=await awDB.getDocument(AW_DB,AW_PLAYERS,savedUser);
+      const saved=JSON.parse(doc.data);
+      _playerMeta={passwordHash:saved.passwordHash||'',created:saved.created||''};
+      applyPlayerData(saved);
+      currentUser=savedUser;playerName=savedUser;
+      subscribeToRealtime();
+      await loadPrices();
+      await loadDailyEvent();
+      const ls=document.getElementById('login-screen');
+      ls.classList.add('fade-out');
+      setTimeout(()=>{ls.style.display='none';},420);
+      render();
+    }catch(e){
+      localStorage.removeItem(SESS_KEY);// Session invalid
+    }
+  }
+
+  // Fallback local tick — only fires if Realtime hasn't updated in 90s
+  setInterval(localFallbackTick,60000);
+
+  // 1-second interval for contract countdown + news timestamps
   setInterval(()=>{
     if(activeTab==='contract')
       document.querySelectorAll('.ac-card').forEach(card=>{
@@ -2122,6 +2295,10 @@ window.addEventListener('DOMContentLoaded',()=>{
           const metaEl=card.querySelector('.ac-meta');
           if(metaEl)metaEl.textContent='#'+c.id+' · '+fmtCountdown(c.expiryTime-Date.now());
         }
+      });
+    if(activeTab==='news')
+      document.querySelectorAll('.nc-ago').forEach((el,i)=>{
+        if(newsItems[i])el.textContent=timeAgo(newsItems[i].time);
       });
   },1000);
 });
